@@ -2,3 +2,4 @@ openai
 pypdf
 python-docx
 ebooklib
+reportlab
