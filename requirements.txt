@@ -1,3 +1,4 @@
 openai
 pypdf
 python-docx
+ebooklib
