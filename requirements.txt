@@ -1,4 +1,4 @@
-google
+google-generateai
 pypdf
 python-docx
 ebooklib
