@@ -3,4 +3,3 @@ pypdf
 python-docx
 ebooklib
 reportlab
-gemini
