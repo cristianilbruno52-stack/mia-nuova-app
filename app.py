@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from xml.sax.saxutils import escape
 
 import streamlit as st
-from openai import OpenAI
+import google.generativeai as genai
 from pypdf import PdfReader
 from docx import Document
 from ebooklib import epub, ITEM_DOCUMENT
@@ -163,16 +163,16 @@ def make_epub(text: str, title: str, author: str) -> bytes:
 # AI E REVISIONE
 # ------------------------------------------------------------
 def get_api_key() -> str:
+    """Recupera la chiave API di Google Gemini da Secrets o variabili d'ambiente."""
     try:
-        return st.secrets.get("OPENAI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
+        return (
+            st.secrets.get("GOOGLE_API_KEY", "")
+            or st.secrets.get("GEMINI_API_KEY", "")
+            or os.getenv("GOOGLE_API_KEY", "")
+            or os.getenv("GEMINI_API_KEY", "")
+        )
     except Exception:
-        return os.getenv("OPENAI_API_KEY", "")
-
-def get_client():
-    key = get_api_key()
-    if not key:
-        return None
-    return OpenAI(api_key=key)
+        return os.getenv("GOOGLE_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
 
 def split_text(text: str, max_chars: int = 9000):
     """Divide il testo in blocchi senza alterare gli a capo originali."""
@@ -190,21 +190,27 @@ def split_text(text: str, max_chars: int = 9000):
     return chunks or [""]
 
 def ask_ai(prompt: str, system_prompt: str, model: str, temperature: float = 0.2) -> str:
-    client = get_client()
-    if client is None:
+    """
+    Chiama un modello Gemini tramite l'SDK google-generativeai.
+    Il system prompt viene passato come system_instruction del modello.
+    """
+    api_key = get_api_key()
+    if not api_key:
         raise RuntimeError(
-            "Chiave API non configurata. Inserisci OPENAI_API_KEY nei Secrets "
-            "di Streamlit oppure come variabile d'ambiente."
+            "Chiave API non configurata. Inserisci GOOGLE_API_KEY (o GEMINI_API_KEY) "
+            "nei Secrets di Streamlit oppure come variabile d'ambiente."
         )
-    response = client.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
+    genai.configure(api_key=api_key)
+    gemini_model = genai.GenerativeModel(model, system_instruction=system_prompt)
+    response = gemini_model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(temperature=temperature),
     )
-    return response.choices[0].message.content.strip()
+    if not response.candidates:
+        raise RuntimeError(
+            "Risposta vuota o bloccata dal modello (nessun candidato disponibile)."
+        )
+    return response.text.strip()
 
 def save_version(label: str):
     st.session_state.versions.append({
@@ -263,7 +269,11 @@ st.markdown("""
 
 with st.sidebar:
     st.header("Impostazioni")
-    model = st.selectbox("Modello AI", ["gpt-4.1-mini", "gpt-4.1"], index=0)
+    model = st.selectbox(
+        "Modello AI (Gemini)",
+        ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"],
+        index=1,
+    )
     language = st.selectbox("Lingua", ["italiano", "inglese", "francese", "spagnolo", "tedesco"])
     intensity = st.select_slider("Intensità revisione", ["Leggera", "Standard", "Approfondita"], value="Standard")
     preserve_style = st.toggle("Mantieni stile e voce dell'autore", value=True)
