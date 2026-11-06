@@ -169,9 +169,8 @@ Non inventare trama, credenziali, premi, pubblico o volumi di ricerca. Mantieni 
 
 
 # --- Preflight copertine e illustrazioni ---
-"""Preflight indicativo per copertine e interni KDP; non modifica i file originali.
-L'analisi visiva, se abilitata, invia le immagini al provider AI configurato.
-"""
+# Preflight indicativo per copertine e interni KDP.
+# Se attivata, l’analisi visiva invia le immagini al provider AI configurato.
 
 import csv
 import hashlib
