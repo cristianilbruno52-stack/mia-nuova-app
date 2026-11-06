@@ -384,6 +384,10 @@ def make_chunks(text, max_chars=6000, context_chars=1400):
 # ---------------------------------------------------------------------
 # GEMINI
 # ---------------------------------------------------------------------
+class QuotaExhaustedError(RuntimeError):
+    """Quota API esaurita: riprovare subito aumenterebbe soltanto gli errori."""
+
+
 def get_api_key():
     if st.session_state.get("google_api_key"):
         return st.session_state.google_api_key
@@ -416,7 +420,13 @@ def ask_ai(prompt, system_prompt, model, temperature=0.0, json_mode=False):
         except Exception as exc:  # noqa: BLE001
             message = str(exc)
             upper = message.upper()
-            transient = any(key in upper for key in ("429", "503", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "TIMEOUT", "DEADLINE"))
+            if "429" in upper or "RESOURCE_EXHAUSTED" in upper or "QUOTA" in upper:
+                # Un 429 di quota non viene ritentato: piano/billing oppure reset
+                # della finestra temporale sono azioni esterne all'applicazione.
+                raise QuotaExhaustedError(
+                    "Quota Gemini esaurita. Controlla piano e fatturazione oppure attendi il reset "
+                    "della quota. Le richieste rimanenti sono state fermate per evitare sprechi.") from exc
+            transient = any(key in upper for key in ("503", "UNAVAILABLE", "TIMEOUT", "DEADLINE"))
             if attempt < 2 and transient:
                 time.sleep(3 * (attempt + 1))
                 continue
@@ -556,6 +566,17 @@ def check_grammar_ai(text, model, language, block_chars=6000):
                 candidates.append({"pos": chunk["start"] + occurrences[0], "errore": error,
                                    "correzione": fix, "tipo": str(item.get("tipo", ""))[:30],
                                    "spiegazione": str(item.get("spiegazione", ""))[:200]})
+        except QuotaExhaustedError as exc:
+            failed.append(f"Blocco {index}, analisi: {str(exc)}")
+            # Circuit breaker: non martellare l'API con tutti gli altri blocchi.
+            for remaining in range(index + 1, total + 1):
+                failed.append(f"Blocco {remaining}: non eseguito per quota Gemini esaurita.")
+            bar.progress(1.0, text="Controllo fermato: quota Gemini esaurita")
+            bar.empty()
+            items.sort(key=lambda item: item["pos"])
+            return {"sig": hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest(), "items": items,
+                    "blocks": total, "failed": failed, "discarded": discarded, "unverified": unverified,
+                    "checked": checked, "complete": False, "quota_exhausted": True}
         except Exception as exc:  # noqa: BLE001
             failed.append(f"Blocco {index}, analisi: {str(exc)[:250]}")
             bar.progress(index / total, text=f"Blocco {index}/{total}: analisi fallita")
@@ -569,6 +590,21 @@ def check_grammar_ai(text, model, language, block_chars=6000):
             verdicts = verify_candidates(chunk, candidates, model, language)
             if len(verdicts) != len(candidates):
                 raise RuntimeError(f"Verifica incompleta: {len(verdicts)}/{len(candidates)} risposte.")
+        except QuotaExhaustedError as exc:
+            failed.append(f"Blocco {index}, verifica: {str(exc)}")
+            for candidate in candidates:
+                candidate.update(auto=False, fonte="AI non verificata",
+                                 spiegazione="Verifica non eseguita per quota esaurita: controllo umano obbligatorio.")
+                items.append(candidate)
+                unverified += 1
+            for remaining in range(index + 1, total + 1):
+                failed.append(f"Blocco {remaining}: non eseguito per quota Gemini esaurita.")
+            bar.progress(1.0, text="Controllo fermato: quota Gemini esaurita")
+            bar.empty()
+            items.sort(key=lambda item: item["pos"])
+            return {"sig": hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest(), "items": items,
+                    "blocks": total, "failed": failed, "discarded": discarded, "unverified": unverified,
+                    "checked": checked, "complete": False, "quota_exhausted": True}
         except Exception as exc:  # noqa: BLE001
             failed.append(f"Blocco {index}, verifica: {str(exc)[:250]}")
             for candidate in candidates:
@@ -723,11 +759,18 @@ def run_revision(text, ranges, task, language, intensity, preserve_style, model,
             chunks.append((range_index, start + chunk["start"], start + chunk["end"], chunk))
     outputs = {index: [] for index in range(len(ranges))}
     log = []
+    quota_stop = False
     bar = st.progress(0, text="Revisione AI...")
     for number, (range_index, start, end, chunk) in enumerate(chunks, 1):
         source = chunk["text"]
         final = source
         status, notes, ratio = "", [], None
+        if quota_stop:
+            status, notes = "non eseguito (quota esaurita)", ["Testo originale conservato senza chiamare l'API."]
+            outputs[range_index].append(final)
+            log.append({"blocco": number, "stato": status, "lunghezza_%": None, "note": "; ".join(notes)})
+            bar.progress(number / len(chunks), text=f"Blocco {number}/{len(chunks)}: saltato per quota")
+            continue
         try:
             prompt = f"CONTESTO PRECEDENTE (non revisionare):\n{chunk['previous']}\n\n<<<TESTO_DA_REVISIONARE\n{source}\nTESTO_DA_REVISIONARE>>>\n\nCONTESTO SUCCESSIVO (non revisionare):\n{chunk['next']}"
             raw = ask_ai(prompt, build_revision_system(task, language, intensity, preserve_style), model, 0.2)
@@ -738,6 +781,8 @@ def run_revision(text, ranges, task, language, intensity, preserve_style, model,
             else:
                 status = "accettato con avviso" if notes else "accettato"
                 final = candidate
+        except QuotaExhaustedError as exc:
+            status, notes, quota_stop = "errore quota (originale conservato)", [str(exc)], True
         except Exception as exc:  # noqa: BLE001
             status, notes = "errore (originale conservato)", [str(exc)[:250]]
         outputs[range_index].append(final)
@@ -1127,7 +1172,14 @@ with tabs[4]:
         m4.metric("Errori confermati / 1000 parole", round(confirmed_count / max(1, count_words(text_now)) * 1000, 1))
         if review_count:
             st.info(f"{review_count} segnalazioni richiedono verifica umana e NON possono essere applicate automaticamente.")
-        if grammar["failed"]:
+        if grammar.get("quota_exhausted"):
+            st.error("QUOTA GEMINI ESAURITA — controllo fermato subito per non sprecare altre chiamate. "
+                     "Il testo non è stato modificato. Controlla piano e fatturazione su Google AI Studio "
+                     "oppure attendi il reset della quota. Le regole locali restano disponibili.")
+            st.link_button("Apri la guida Google su quote e limiti", "https://ai.google.dev/gemini-api/docs/rate-limits")
+            with st.expander("Dettaglio dei blocchi non analizzati"):
+                st.write("\n".join(grammar["failed"]))
+        elif grammar["failed"]:
             st.error("Controllo AI INCOMPLETO: " + " · ".join(grammar["failed"][:8]))
         elif grammar["blocks"]:
             st.success("Tutti i blocchi AI sono stati effettivamente controllati.")
