@@ -1853,13 +1853,18 @@ def render_kdp_tab(model: str, ask_ai_fn: Any, api_key_configured: bool, languag
         _report_view(report.get("controlli", []), report.get("riepilogo", {}))
 
     with st.expander("Cosa non può certificare questo controllo"):
-        st.markdown(
+      ,,,  st.markdown(
             "- Non sostituisce il **Print Previewer KDP**, che verifica il file rispetto alla configurazione effettiva dell'account.\n"
             "- Per paperback il calcolo del dorso è stimato da pagina, carta e inchiostro; confrontalo con il Cover Calculator KDP.\n"
             "- Per hardcover serve il template KDP corretto: il wrap e le cerniere non si possono dedurre con affidabilità dal solo conteggio pagine.\n"
             "- L'AI può non riconoscere refusi o tagli; non garantisce la qualità editoriale, i diritti d'autore, il barcode o l'approvazione KDP.\n"
-            "- La verifica del DPI delle immagini interne è precisa quando il PDF contiene immagini raster e le dimensioni di collocazione sono leggibili; elementi vettoriali non hanno DPI raster."
-        )
+            "- La verifica del DPI delle immagini interne è precisa quando il PDF contiene immagini raster e le dimensioni di collocazione sono leggibili; elementi vettoriali non hanno DPI raster.",,,)
+       
+        
+      
+        
+        
+    
 
         
         
