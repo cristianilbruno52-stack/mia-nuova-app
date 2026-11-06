@@ -668,3 +668,88 @@ def render_kdp_tab(model: str, ask_ai_fn: Callable[..., str], api_key_configured
                     '- La stima paperback va confermata sul template ufficiale; per hardcover usa il template corretto.\n'
                     '- DPI, font e immagini possono non essere rilevati correttamente in PDF complessi.\n'
                     '- L’AI può sbagliare o non leggere il testo: controlla anche margini, barcode, diritti e qualità manualmente.')
+
+
+# --- Avvio autonomo Streamlit ---
+def _parse_json_response(raw: str) -> dict[str, Any]:
+    cleaned = re.sub(r'^\s*```(?:json)?\s*|\s*```\s*$', '', raw.strip(), flags=re.I)
+    obj = json.loads(cleaned)
+    if not isinstance(obj, dict):
+        raise ValueError('La risposta del modello non è un oggetto JSON.')
+    return obj
+
+
+def main() -> None:
+    import os
+    st.set_page_config(page_title='Libro Master — SEO e preflight KDP', layout='wide')
+    st.title('Libro Master — SEO e preflight KDP')
+    st.caption('Genera metadati editoriali e verifica indicativamente i file per Amazon KDP.')
+    with st.sidebar:
+        st.header('Configurazione AI')
+        api_key = st.text_input('Chiave API Google Gemini', type='password',
+                                help='Puoi anche usare la variabile d’ambiente GOOGLE_API_KEY.')
+        api_key = api_key.strip() or os.environ.get('GOOGLE_API_KEY', '').strip()
+        model = st.text_input('Modello Gemini', value='gemini-2.5-flash').strip()
+        st.caption('La chiave è necessaria solo per le funzioni AI. Il preflight tecnico funziona anche senza.')
+        st.warning('Quando usi l’AI, estratti del manoscritto o immagini vengono inviati a Google. Verifica privacy e costi.')
+
+    def get_key() -> str:
+        return api_key
+
+    def call_ai(prompt: Any, system: str, model_name: str, temperature: float,
+                json_mode: bool = False) -> str:
+        if not api_key:
+            raise ValueError('Inserisci la chiave API Google Gemini nella barra laterale.')
+        if not model_name:
+            raise ValueError('Inserisci il nome del modello Gemini.')
+        try:
+            from google import genai
+            from google.genai import types as genai_types
+        except ImportError as exc:
+            raise RuntimeError('Installa il pacchetto google-genai: pip install google-genai') from exc
+        client = genai.Client(api_key=api_key)
+        options: dict[str, Any] = {'system_instruction': system, 'temperature': temperature}
+        if json_mode:
+            options['response_mime_type'] = 'application/json'
+        response = client.models.generate_content(model=model_name, contents=prompt,
+                                                  config=genai_types.GenerateContentConfig(**options))
+        result = response.text
+        if not result:
+            raise ValueError('Il modello non ha restituito testo. Controlla risposta e impostazioni del modello.')
+        return result
+
+    seo_tab, preflight_tab = st.tabs(['Metadati SEO', 'Preflight KDP'])
+    with seo_tab:
+        st.markdown('#### Manoscritto')
+        uploaded = st.file_uploader('Carica il manoscritto TXT o PDF (facoltativo)',
+                                    type=['txt', 'pdf'], key='main_manuscript')
+        manual_text = st.text_area('Oppure incolla il testo del manoscritto', height=180, key='main_text')
+        text = manual_text
+        filename = 'testo_incollato.txt'
+        if uploaded:
+            filename = uploaded.name
+            try:
+                content = uploaded.getvalue()
+                if uploaded.name.lower().endswith('.pdf'):
+                    if fitz is None:
+                        raise RuntimeError('Installa PyMuPDF per leggere i PDF.')
+                    with fitz.open(stream=content, filetype='pdf') as doc:
+                        if doc.is_encrypted:
+                            raise ValueError('PDF protetto da password.')
+                        text = '\n'.join(page.get_text() for page in doc)
+                    if not text.strip():
+                        st.warning('Il PDF non contiene testo estraibile. Per un PDF scansionato serve OCR: incolla il testo manualmente o carica un TXT.')
+                        text = manual_text
+                else:
+                    text = content.decode('utf-8-sig')
+                st.caption(f'Testo disponibile: {len(text):,} caratteri. Verrà inviato all’AI solo un estratto.')
+            except Exception as exc:
+                st.error(f'Impossibile leggere il manoscritto: {exc}. Per TXT usa UTF-8; in alternativa incolla il testo.')
+                text = manual_text
+        render_seo_kdp_tab(text, filename, model, get_key, call_ai, _parse_json_response)
+    with preflight_tab:
+        render_kdp_tab(model, call_ai, bool(api_key), language='italiano')
+
+
+if __name__ == '__main__':
+    main()
