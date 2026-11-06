@@ -215,6 +215,7 @@ DEFAULTS = {
     "flash": [],
     "doc_info": {},
     "revision_log": [],
+    "grammar": None,
     "uploader_gen": 0,
     "seo_title": "",
     "seo_subtitle": "",
@@ -639,11 +640,10 @@ def chapter_table(text: str, chapters, wpp: int, page_offsets=None):
     rows, n = [], 0
     for sp in chapter_spans(text, chapters):
         words = count_words(text[sp["start"]:sp["end"]])
-        row = {"#": "" if sp["front"] else 0, "Titolo": sp["title"], "Parole": words,
-               "Pagine stimate": round(words / max(1, wpp), 1)}
         if not sp["front"]:
             n += 1
-            row["#"] = n
+        row = {"#": "—" if sp["front"] else str(n), "Titolo": sp["title"], "Parole": words,
+               "Pagine stimate": round(words / max(1, wpp), 1)}
         if page_offsets:
             row["Pagina inizio (PDF reale)"] = bisect_right(page_offsets, sp["start"])
             row["Pagina fine (PDF reale)"] = bisect_right(page_offsets, max(sp["start"], sp["end"] - 1))
@@ -1133,6 +1133,154 @@ def run_revision(segments, task, language, intensity, preserve_style, model, str
     return ["\n".join(o) for o in outs], log
 
 
+def parse_json_list(raw: str) -> list:
+    cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", raw.strip(), flags=re.I)
+    start, end = cleaned.find("["), cleaned.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("Nessuna lista JSON nella risposta.")
+    data = json.loads(cleaned[start:end + 1])
+    if not isinstance(data, list):
+        raise ValueError("Il JSON ricevuto non è una lista.")
+    return [d for d in data if isinstance(d, dict)]
+
+
+# ---- regole locali (italiano): funzionano senza AI e senza chiave API ----
+WORD_FIXES = {
+    "perchè": "perché", "poichè": "poiché", "affinchè": "affinché", "benchè": "benché",
+    "finchè": "finché", "cosicchè": "cosicché", "giacchè": "giacché", "pultroppo": "purtroppo",
+    "sopratutto": "soprattutto", "propio": "proprio", "daccordo": "d'accordo",
+    "accellerare": "accelerare", "eccezzione": "eccezione", "qual'è": "qual è",
+    "quì": "qui", "quà": "qua", "fà": "fa", "stà": "sta", "sù": "su", "nò": "no",
+    "pò": "po'", "sè": "sé",
+}
+_PARTICIPLES = (r"(?:fatto|detto|visto|preso|avuto|dato|mangiato|scritto|letto|capito|"
+                r"voluto|potuto|saputo|portato)")
+_WORD_FIX_RE = re.compile(
+    r"(?<![\w'’])(" + "|".join(re.escape(k) for k in sorted(WORD_FIXES, key=len, reverse=True)) + r")(?!\w)",
+    re.I)
+_BAD_ELISION_RE = re.compile(r"\b(un|l|dell|nell|all|sull|quest|quell|d|dov|com)['’] +(?=[a-zà-ÿ])", re.I)
+_REPEAT_OK = {"bene", "piano", "così", "forte", "presto", "adagio", "poco", "giù", "sempre", "tanto", "pian"}
+
+
+def _case_like(src: str, fix: str) -> str:
+    if len(src) > 1 and src.isupper():
+        return fix.upper()
+    return fix[0].upper() + fix[1:] if src[:1].isupper() else fix
+
+
+def local_grammar_check(text: str, limit: int = 3000):
+    """Controlli deterministici: ogni voce cita testo realmente presente, con posizione esatta."""
+    found = []
+
+    def add(m, fix, tipo, spieg, auto=True):
+        found.append({"pos": m.start(), "errore": m.group(0), "correzione": fix, "tipo": tipo,
+                      "spiegazione": spieg, "auto": auto, "fonte": "regole"})
+
+    for m in _WORD_FIX_RE.finditer(text):
+        add(m, _case_like(m.group(1), WORD_FIXES[m.group(1).lower()]), "ortografia", "Forma errata (accento/apostrofo/grafia).")
+    for m in re.finditer(r"\bun po(?![\w'’])", text, re.I):
+        add(m, m.group(0) + "'", "ortografia", "«un po'» è un troncamento: richiede l'apostrofo.")
+    for m in re.finditer(rf"\b(lui|lei|egli|ella|che|chi|non|mai|già)\s+a\s+({_PARTICIPLES})\b", text, re.I):
+        add(m, f"{m.group(1)} ha {m.group(2)}", "grammatica", "Verbo avere: «ha», non la preposizione «a».")
+    for m in re.finditer(rf"\b(io|non|che|già|mai)\s+o\s+({_PARTICIPLES})\b", text, re.I):
+        add(m, f"{m.group(1)} ho {m.group(2)}", "grammatica", "Verbo avere: «ho», non la congiunzione «o».")
+    for m in re.finditer(r"\b(lui|lei|egli|ella|non|questo|quello|tutto|ciò|che)\s+e\s+"
+                         r"(stato|stata|stati|state|vero|vera|giusto|giusta|possibile|necessario|bello|bella)\b", text, re.I):
+        add(m, f"{m.group(1)} è {m.group(2)}", "grammatica", "Verbo essere: «è», non la congiunzione «e».")
+    for m in _BAD_ELISION_RE.finditer(text):
+        add(m, m.group(0).rstrip(), "punteggiatura", "Dopo l'apostrofo di elisione non va lo spazio.")
+    for m in re.finditer(r"[A-Za-zÀ-ÿ]{2,}[,;:][A-Za-zÀ-ÿ]{2,}", text):
+        pu = re.search(r"[,;:]", m.group(0))
+        add(m, m.group(0)[:pu.end()] + " " + m.group(0)[pu.end():], "punteggiatura", "Manca lo spazio dopo la punteggiatura.")
+    for m in re.finditer(r"[a-zà-ÿ]{3,}\.[A-ZÀ-Ý][a-zà-ÿ]{2,}", text):
+        if not re.search(r"www|http|\.(?:com|it|org|net)\b", m.group(0), re.I):
+            d = m.group(0).index(".")
+            add(m, m.group(0)[:d + 1] + " " + m.group(0)[d + 1:], "punteggiatura", "Manca lo spazio dopo il punto.")
+    for m in re.finditer(r"[,;]{2,}", text):
+        add(m, m.group(0)[0], "punteggiatura", "Punteggiatura doppia.")
+    for m in re.finditer(r"(?<![.])\.\.(?![.])", text):
+        add(m, ".", "punteggiatura", "Due punti consecutivi: punto singolo o puntini di sospensione (…).")
+    for m in re.finditer(r"(?<=\w) +([,;:!?]|\.(?!\.))", text):
+        add(m, m.group(1), "punteggiatura", "Spazio prima della punteggiatura (in italiano non va).")
+    for m in re.finditer(r"\b(\w{3,})\s+\1\b", text, re.I):
+        if m.group(1).lower() not in _REPEAT_OK:
+            add(m, m.group(1), "grammatica", "Parola ripetuta di seguito (controlla che non sia voluto).")
+    pos = 0
+    for para in re.split(r"(\n\s*\n)", text):
+        for o, c, nome in (("(", ")", "parentesi"), ("«", "»", "virgolette caporali")):
+            if para.count(o) != para.count(c):
+                exc = para.strip()[:60]
+                if exc:
+                    found.append({"pos": pos + para.index(exc), "errore": exc, "correzione": "—",
+                                  "tipo": "punteggiatura",
+                                  "spiegazione": f"{nome.capitalize()} non bilanciate in questo paragrafo: da verificare a mano.",
+                                  "auto": False, "fonte": "regole"})
+        pos += len(para)
+    found.sort(key=lambda d: d["pos"])
+    out, last_end = [], -1
+    for it in found:
+        if it["pos"] >= last_end or not it["auto"]:
+            out.append(it)
+            last_end = max(last_end, it["pos"] + len(it["errore"])) if it["auto"] else last_end
+    return out[:limit]
+
+
+def merge_items(ai_items, local_items):
+    merged = [dict(i, auto=True, fonte="AI") for i in ai_items]
+    for it in local_items:
+        a, b = it["pos"], it["pos"] + len(it["errore"])
+        if not any(a < o["pos"] + len(o["errore"]) and o["pos"] < b for o in merged):
+            merged.append(it)
+    merged.sort(key=lambda d: d["pos"])
+    return merged
+
+
+
+def check_grammar(text: str, model: str, language: str, block_chars: int = 6000):
+    """Segnala errori SENZA modificare il testo. Ogni segnalazione deve citare
+    una frase realmente presente nel blocco: le altre vengono scartate e contate."""
+    system = (
+        f"Sei un correttore di bozze esperto di {language}. Trova SOLO errori oggettivi di "
+        "grammatica, ortografia, concordanza, punteggiatura e sintassi. Ignora scelte di stile, "
+        "dialetti, forme volutamente colloquiali e nomi propri. Per ogni errore copia in 'errore' "
+        "la porzione di testo ESATTA (max 80 caratteri, identica all'originale). Rispondi "
+        "esclusivamente con una lista JSON di oggetti con chiavi: errore, correzione, tipo "
+        "(grammatica|ortografia|concordanza|punteggiatura|sintassi), spiegazione (max 15 parole). "
+        "Se non ci sono errori rispondi []. Nessun markdown, nessun commento."
+    )
+    chunks = split_text(text, block_chars)
+    items, failed, discarded, seen, approx = [], [], 0, set(), 0
+    bar = st.progress(0, text="Controllo grammaticale...")
+    for n, chunk in enumerate(chunks, start=1):
+        if chunk.strip():
+            try:
+                for it in parse_json_list(ask_ai(chunk, system, model, 0.0)):
+                    err = str(it.get("errore", "")).strip()
+                    fix = str(it.get("correzione", "")).strip()
+                    if not err or not fix or err == fix or err not in chunk:
+                        discarded += 1
+                        continue
+                    pos = text.find(err, max(0, approx - 300))
+                    if pos == -1:
+                        pos = text.find(err)
+                    if pos == -1 or (pos, err) in seen:
+                        discarded += 1
+                        continue
+                    seen.add((pos, err))
+                    items.append({"pos": pos, "errore": err, "correzione": fix,
+                                  "tipo": str(it.get("tipo", ""))[:30],
+                                  "spiegazione": str(it.get("spiegazione", ""))[:160],
+                                  "auto": True, "fonte": "AI"})
+            except Exception as exc:  # noqa: BLE001
+                failed.append(f"Blocco {n}: {str(exc)[:150]}")
+        approx += len(chunk) + 1
+        bar.progress(n / len(chunks), text=f"Controllo blocco {n}/{len(chunks)}")
+    bar.empty()
+    items.sort(key=lambda d: d["pos"])
+    return {"sig": hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest(),
+            "items": items, "blocks": len(chunks), "failed": failed, "discarded": discarded}
+
+
 # ------------------------------------------------------------
 # ESPORTAZIONE
 # ------------------------------------------------------------
@@ -1331,9 +1479,9 @@ chapters_now = detect_chapters(text_now, custom_pat)
 info = st.session_state.doc_info
 original = st.session_state.original_text
 
-tab_editor, tab_verify, tab_tools, tab_ai, tab_seo, tab_history, tab_export = st.tabs([
+tab_editor, tab_verify, tab_tools, tab_ai, tab_gram, tab_seo, tab_history, tab_export = st.tabs([
     "✍️ Importa ed Editor", "🧪 Verifica e verità", "🧹 Pulizia e strumenti",
-    "✨ Revisione AI", "🔎 Titoli e SEO", "🕘 Versioni", "⬇️ Esporta",
+    "✨ Revisione AI", "📝 Errori grammaticali", "🔎 Titoli e SEO", "🕘 Versioni", "⬇️ Esporta",
 ])
 
 # ============================ EDITOR ============================
@@ -1687,6 +1835,98 @@ with tab_ai:
         st.dataframe(pd.DataFrame(log), hide_index=True)
     st.caption("Controlla sempre il risultato prima della pubblicazione: l'AI può sbagliare anche "
                "quando i controlli automatici non rilevano anomalie.")
+
+# ======================== ERRORI GRAMMATICALI ========================
+with tab_gram:
+    st.subheader("Segnalazione errori grammaticali")
+    st.caption("Il controllo NON modifica il testo: elenca gli errori con pagina, capitolo, "
+               "correzione proposta e spiegazione. Poi scegli tu cosa applicare.")
+    is_it = language == "italiano"
+    gram_blocks = len([c for c in split_text(text_now, 6000) if c.strip()]) if text_now.strip() else 0
+    sig_now = hashlib.sha1(text_now.encode("utf-8", "ignore")).hexdigest()
+    b1, b2 = st.columns(2)
+    with b1:
+        st.markdown("**⚡ Controllo rapido** — regole locali, gratis, senza chiave API")
+        st.caption("Accenti e apostrofi (perchè, qual'è, un pò), «ha/ho/è» scritti male, punteggiatura, "
+                   "parole ripetute, parentesi non chiuse. Solo italiano.")
+        if st.button("⚡ Controlla (senza AI)", disabled=not (text_now.strip() and is_it), key="run_local"):
+            st.session_state.grammar = {"sig": sig_now, "items": local_grammar_check(text_now),
+                                        "blocks": 0, "failed": [], "discarded": 0, "source": "regole locali"}
+        if not is_it:
+            st.caption("Le regole locali sono disponibili solo con lingua «italiano».")
+    with b2:
+        st.markdown("**📝 Controllo completo con AI** — regole locali + Gemini")
+        st.caption(f"Invia **{gram_blocks} blocchi** a Google Gemini. Trova anche errori che le regole non vedono.")
+        if st.button("📝 Controlla con AI", type="primary", disabled=gram_blocks == 0, key="run_grammar"):
+            if not get_api_key():
+                st.error("Configura prima la chiave API di Google nella sidebar.")
+            else:
+                res, err = safe_call(check_grammar, text_now, model, language)
+                if err:
+                    st.error(f"Controllo non completato: {err}")
+                else:
+                    res["items"] = merge_items(res["items"], local_grammar_check(text_now) if is_it else [])
+                    res["source"] = "AI + regole locali" if is_it else "AI"
+                    st.session_state.grammar = res
+    st.caption("Nessun controllo automatico è completo: «nessun errore» non è una garanzia che il testo sia perfetto.")
+
+    g = st.session_state.grammar
+    if g:
+        st.markdown(f"##### Risultato · fonte: {g.get('source', 'AI')}")
+        if g["sig"] != sig_now:
+            st.warning("Il testo è cambiato dopo il controllo: gli errori elencati potrebbero non "
+                       "essere più aggiornati. Rilancia il controllo.")
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric("Errori segnalati", len(g["items"]))
+        g2.metric("Blocchi AI controllati",
+                  "—" if not g["blocks"] else f"{g['blocks'] - len(g['failed'])}/{g['blocks']}")
+        g3.metric("Segnalazioni AI scartate", g["discarded"],
+                  help="L'AI ha citato un testo che non esiste nel libro: scartata per non inventare errori.")
+        g4.metric("Errori per 1000 parole", round(len(g["items"]) / max(1, count_words(text_now)) * 1000, 1))
+        if g["failed"]:
+            st.warning("Alcuni blocchi NON sono stati controllati: " + "; ".join(g["failed"][:5]))
+        if not g["items"]:
+            st.success("Nessun errore segnalato dai controlli eseguiti.")
+        else:
+            offsets = info.get("offset_pagine") if (info.get("formato") == "PDF" and text_now == original) else None
+            rows = []
+            for it in g["items"]:
+                row = {"Applica": False}
+                if offsets:
+                    row["Pagina PDF"] = bisect_right(offsets, it["pos"])
+                prev = [c["title"] for c in chapters_now if c["start"] <= it["pos"]]
+                row["Capitolo"] = prev[-1][:40] if prev else "—"
+                row.update({"Fonte": it.get("fonte", "AI"), "Tipo": it["tipo"], "Errore": it["errore"],
+                            "Correzione": it["correzione"], "Spiegazione": it["spiegazione"]})
+                rows.append(row)
+            df_g = pd.DataFrame(rows)
+            if not offsets and info.get("formato") == "PDF":
+                st.caption("Il numero di pagina compare solo finché il testo coincide con il PDF originale importato.")
+            edited_g = st.data_editor(df_g, hide_index=True, key="grammar_editor",
+                                      disabled=[c for c in df_g.columns if c != "Applica"])
+            st.download_button("Scarica elenco errori (CSV)",
+                               data=df_g.drop(columns=["Applica"]).to_csv(index=False).encode("utf-8-sig"),
+                               file_name="errori_grammaticali.csv", mime="text/csv")
+            chosen = [i for i, v in enumerate(edited_g["Applica"].tolist()) if v]
+            st.caption("Le voci con correzione «—» (parentesi non bilanciate) vanno sistemate a mano.")
+            if st.button(f"Applica le {len(chosen)} correzioni selezionate", disabled=not chosen):
+                if g["sig"] != sig_now:
+                    st.error("Il testo è cambiato: rilancia il controllo prima di applicare.")
+                else:
+                    new_text, done, skipped = text_now, 0, 0
+                    for i in sorted(chosen, key=lambda k: g["items"][k]["pos"], reverse=True):
+                        it = g["items"][i]
+                        a, b = it["pos"], it["pos"] + len(it["errore"])
+                        if it.get("auto", True) and new_text[a:b] == it["errore"]:
+                            new_text = new_text[:a] + it["correzione"] + new_text[b:]
+                            done += 1
+                        else:
+                            skipped += 1
+                    st.session_state.grammar = None
+                    apply_text(new_text, "Correzioni grammaticali selezionate",
+                               f"{done} correzioni applicate, {skipped} saltate (da fare a mano). "
+                               "Rilancia il controllo per verificare.",
+                               "success" if done else "warning")
 
 # ============================== SEO ==============================
 with tab_seo:
