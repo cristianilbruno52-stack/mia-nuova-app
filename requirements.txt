@@ -1,6 +1,7 @@
+streamlit>=1.40
 google-genai
 pypdf
 python-docx
 ebooklib
 reportlab
-streamlit
+pandas
